@@ -1,0 +1,6 @@
+# Release binaries and archives must never be committed (they live in
+# Actions artifacts and Release assets only).
+*.exe
+*.zip
+*.dll
+*.msi
