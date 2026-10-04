@@ -1,0 +1,63 @@
+Windows ARM64 Tunnel Client Builds (unofficial)
+Copyright 2026 conashin
+
+This is an unofficial build. It is not affiliated with, endorsed by,
+sponsored by, or supported by Cloudflare, Inc.
+本專案為個人維護的非官方建置，與 Cloudflare, Inc. 無關，亦未經其認可、
+贊助或背書。
+
+This NOTICE accompanies the Windows ARM64 builds of the cloudflared client,
+for use with Cloudflare Tunnel™, published at
+https://github.com/conashin/Tunnel-Client-Win-ARM64
+
+1. Upstream software
+
+   cloudflared.exe in this archive is compiled from the source code of
+   https://github.com/cloudflare/cloudflared
+   Copyright Cloudflare, Inc.
+   Licensed under the Apache License, Version 2.0.
+
+   The source code is NOT modified: no patches are applied and no source
+   file, go.mod or go.sum is changed. The exact upstream version and commit
+   of each build are stated in the release notes. The upstream license text
+   is included in this archive as LICENSE. If the upstream project ships a
+   NOTICE file for the built version, it is included as UPSTREAM-NOTICE.
+
+2. Differences from the official builds
+
+   - GOARCH=arm64. The official releases provide windows-386 and
+     windows-amd64 only.
+   - CGO_ENABLED=0. The Windows ICMP proxy (ingress/icmp_windows.go, which
+     requires cgo) is therefore not compiled in; the generic fallback is
+     used instead. The official windows-386 build is also built with
+     CGO_ENABLED=0.
+   - The built-in auto-update is disabled through the linker flag
+     -X github.com/cloudflare/cloudflared/cmd/cloudflared/updater.BuiltForPackageManager=...
+     because the updater would replace this executable with a build of a
+     different architecture.
+   - Build flags: -mod=readonly -trimpath -ldflags "-s -w" plus the version
+     stamping flags (main.Version, main.BuildTime) used by the upstream
+     Makefile.
+   - The executable is not code-signed.
+
+3. Third-party software
+
+   The executable statically links third-party Go packages and the Go
+   standard library. Their copyright notices and license texts (MIT, BSD and
+   Apache-2.0 families) are included in this archive:
+
+   - third-party-licenses.csv      list of packages, license URLs and types
+   - THIRD_PARTY_LICENSES/         license texts (and NOTICE files shipped by
+                                   the packages) of each linked package
+   - THIRD_PARTY_LICENSES/go/LICENSE
+                                   license of the Go standard library
+
+   Apache-2.0 section 6 does not grant any rights to use the trade names,
+   trademarks, service marks or product names of the licensor.
+
+4. Trademarks
+
+   Cloudflare, Cloudflare Tunnel, Cloudflare One and WARP are trademarks
+   and/or registered trademarks of Cloudflare, Inc. in the United States and
+   other jurisdictions. The cloudflared source code is distributed under the
+   Apache License 2.0.

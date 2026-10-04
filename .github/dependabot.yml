@@ -1,0 +1,8 @@
+# Keeps the SHA-pinned third-party actions up to date. Dependabot opens a
+# pull request for each update; nothing is merged automatically.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
