@@ -1,0 +1,630 @@
+# Copyright 2026 conashin
+# SPDX-License-Identifier: Apache-2.0
+#
+# Unofficial Windows ARM64 builds of the upstream cloudflared client.
+# The upstream source is compiled as-is; nothing in it is patched.
+
+name: winarm64-build
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to (re)build, format YYYY.M.P. Leave empty for the latest release.'
+        required: false
+        default: ''
+  # Pull requests only run build + smoke-test; they never publish.
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: cloudflare/cloudflared
+
+jobs:
+  check-upstream:
+    name: check-upstream
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Resolve upstream tag and decide whether to build
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          tag_re='^[0-9]{4}\.[0-9]+\.[0-9]+$'
+
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+            if ! [[ "$tag" =~ $tag_re ]]; then
+              echo "::error::Input tag is not in YYYY.M.P format."
+              exit 1
+            fi
+            # From here on the tag is known to be safe to print and reuse.
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            if ! info=$(gh release view "$tag" --repo "$UPSTREAM_REPO" --json tagName,isPrerelease,isDraft 2>&1); then
+              echo "::error::Upstream release $tag could not be found: $info"
+              exit 1
+            fi
+          else
+            info=$(gh release view --repo "$UPSTREAM_REPO" --json tagName,isPrerelease,isDraft)
+            tag=$(jq -r '.tagName' <<<"$info")
+            if ! [[ "$tag" =~ $tag_re ]]; then
+              echo "::error::Latest upstream tag '$tag' is not in YYYY.M.P format."
+              exit 1
+            fi
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$(jq -r '.isPrerelease or .isDraft' <<<"$info")" != "false" ]; then
+            echo "::error::Upstream release $tag is a prerelease or a draft."
+            exit 1
+          fi
+          echo "Upstream release: $tag"
+
+          # Pull requests and runs from branches other than main can never
+          # publish, so they always build (this also lets a test branch
+          # exercise the license gate for a tag that is already released).
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if out=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName 2>&1); then
+            echo "Release $tag already exists in $GITHUB_REPOSITORY; nothing to build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          elif grep -qi 'release not found' <<<"$out"; then
+            echo "No release $tag yet in $GITHUB_REPOSITORY; building."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Could not check for an existing release: $out"
+            exit 1
+          fi
+
+  build:
+    name: build
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.check-upstream.outputs.tag }}
+      # Never let Go silently download a different toolchain than the one
+      # selected from the upstream go.mod.
+      GOTOOLCHAIN: local
+      GO_LICENSES_VERSION: v1.6.0
+    outputs:
+      upstream_commit: ${{ steps.meta.outputs.upstream_commit }}
+      go_version: ${{ steps.meta.outputs.go_version }}
+      exe_sha256: ${{ steps.package.outputs.exe_sha256 }}
+      zip_sha256: ${{ steps.package.outputs.zip_sha256 }}
+      license_gate_failed: ${{ steps.gate.outputs.failed }}
+      license_gate_details: ${{ steps.gate.outputs.details }}
+    steps:
+      - name: Checkout this repository (workflow, NOTICE, compliance baselines)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: self
+          persist-credentials: false
+
+      - name: Checkout upstream source at the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cloudflare/cloudflared
+          ref: refs/tags/${{ needs.check-upstream.outputs.tag }}
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go (version taken from upstream go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: upstream/go.mod
+          cache: false
+
+      - name: Record upstream commit and Go version
+        id: meta
+        run: |
+          set -euo pipefail
+          echo "upstream_commit=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "go_version=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-compile windows/arm64
+        working-directory: upstream
+        env:
+          GOOS: windows
+          GOARCH: arm64
+          CGO_ENABLED: '0'
+          TZ: UTC
+        run: |
+          set -euo pipefail
+          build_time="$(git log -1 --format=%cd --date=format-local:'%Y-%m-%d-%H:%M UTC')"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          go build -mod=readonly -trimpath \
+            -ldflags "-s -w -X \"main.Version=${TAG}\" -X \"main.BuildTime=${build_time}\" -X \"github.com/cloudflare/cloudflared/cmd/cloudflared/updater.BuiltForPackageManager=github.com/${GITHUB_REPOSITORY}\"" \
+            -o "$GITHUB_WORKSPACE/out/cloudflared.exe" \
+            ./cmd/cloudflared
+          sha256sum "$GITHUB_WORKSPACE/out/cloudflared.exe"
+
+      # Any failure in this step is a license gate failure: nothing is
+      # published and report-failure opens a license-review issue.
+      - name: License gate (upstream LICENSE/NOTICE, dependency licenses)
+        id: gate
+        run: |
+          # The runner starts bash with -e; this step collects all problems
+          # first and fails once at the end.
+          set +e
+          set -uo pipefail
+          failed=0
+          details=""
+          add() { details+="$1"$'\n'; failed=1; }
+          # glog-style warnings/info lines from go-licenses are noise.
+          filter() { grep -vE '^[WI][0-9]{4} ' || true; }
+
+          stage="$GITHUB_WORKSPACE/stage"
+          mkdir -p "$stage"
+
+          # 1. Upstream LICENSE must match the reviewed Apache-2.0 baseline.
+          if [ ! -f upstream/LICENSE ]; then
+            add "- Upstream LICENSE file is missing at tag $TAG."
+          else
+            actual=$(sha256sum upstream/LICENSE | cut -d' ' -f1)
+            if [ ! -f self/compliance/upstream-LICENSE.sha256 ]; then
+              add "- Baseline compliance/upstream-LICENSE.sha256 is missing (upstream LICENSE sha256: $actual)."
+            else
+              expected=$(awk 'NR==1 {print $1}' self/compliance/upstream-LICENSE.sha256)
+              if [ "$expected" != "$actual" ]; then
+                add "- Upstream LICENSE changed: expected sha256 $expected, actual sha256 $actual."
+              fi
+            fi
+          fi
+
+          # 2. Upstream NOTICE (if any) must match a reviewed baseline.
+          mapfile -t notices < <(find upstream -maxdepth 1 -type f -iname 'NOTICE*' -printf '%f\n' | LC_ALL=C sort)
+          if [ "${#notices[@]}" -gt 1 ]; then
+            add "- Upstream has several NOTICE files (${notices[*]}); they need a manual review."
+          elif [ "${#notices[@]}" -eq 1 ]; then
+            nf="${notices[0]}"
+            actual=$(sha256sum "upstream/$nf" | cut -d' ' -f1)
+            if ! [[ "$nf" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              add "- Upstream NOTICE file has an unexpected name and needs a manual review (sha256 $actual)."
+            elif [ ! -f self/compliance/upstream-NOTICE.sha256 ]; then
+              add "- Upstream added a NOTICE file '$nf' (sha256 $actual) and no baseline compliance/upstream-NOTICE.sha256 exists (NOTICE changed)."
+            else
+              expected=$(awk 'NR==1 {print $1}' self/compliance/upstream-NOTICE.sha256)
+              if [ "$expected" != "$actual" ]; then
+                add "- Upstream NOTICE file '$nf' changed: expected sha256 $expected, actual sha256 $actual."
+              else
+                echo "UPSTREAM_NOTICE_FILE=$nf" >> "$GITHUB_ENV"
+              fi
+            fi
+          fi
+
+          # 3. Licenses of everything that is linked into windows/arm64.
+          gobin="$RUNNER_TEMP/bin"
+          mkdir -p "$gobin"
+          if ! (cd "$RUNNER_TEMP" && GOBIN="$gobin" go install "github.com/google/go-licenses@${GO_LICENSES_VERSION}") > "$RUNNER_TEMP/gl-install.log" 2>&1; then
+            add "- Could not install go-licenses ${GO_LICENSES_VERSION} with $(go env GOVERSION):"
+            details+="$(filter < "$RUNNER_TEMP/gl-install.log" | tail -n 20)"$'\n'
+          else
+            export GOOS=windows GOARCH=arm64 CGO_ENABLED=0 GOFLAGS=-mod=readonly
+            gl="$gobin/go-licenses"
+            cd upstream
+
+            if ! "$gl" check ./cmd/cloudflared --disallowed_types=forbidden,restricted,unknown > "$RUNNER_TEMP/gl-check.log" 2>&1; then
+              add "- go-licenses check found forbidden, restricted or unidentifiable licenses:"
+              details+="$(filter < "$RUNNER_TEMP/gl-check.log" | tail -n 40)"$'\n'
+            fi
+
+            if "$gl" report ./cmd/cloudflared > "$stage/third-party-licenses.csv" 2> "$RUNNER_TEMP/gl-report.log" \
+               && [ -s "$stage/third-party-licenses.csv" ]; then
+              echo "Third-party packages by license type:"
+              awk -F, '{print $NF}' "$stage/third-party-licenses.csv" | sort | uniq -c | sort -rn
+            else
+              add "- go-licenses report failed or produced no output:"
+              details+="$(filter < "$RUNNER_TEMP/gl-report.log" | tail -n 20)"$'\n'
+            fi
+
+            if ! "$gl" save ./cmd/cloudflared --save_path="$stage/THIRD_PARTY_LICENSES" > "$RUNNER_TEMP/gl-save.log" 2>&1; then
+              add "- go-licenses save failed:"
+              details+="$(filter < "$RUNNER_TEMP/gl-save.log" | tail -n 20)"$'\n'
+            fi
+            cd "$GITHUB_WORKSPACE"
+          fi
+
+          # 4. License of the Go standard library (not covered by go-licenses).
+          goroot_license="$(go env GOROOT)/LICENSE"
+          if [ -f "$goroot_license" ]; then
+            mkdir -p "$stage/THIRD_PARTY_LICENSES/go"
+            cp "$goroot_license" "$stage/THIRD_PARTY_LICENSES/go/LICENSE"
+          else
+            add "- Go standard library LICENSE not found at $goroot_license."
+          fi
+
+          {
+            if [ "$failed" -eq 1 ]; then echo "failed=true"; else echo "failed=false"; fi
+            delim="GATE_$(openssl rand -hex 8)"
+            echo "details<<$delim"
+            printf '%s' "$details" | head -c 20000
+            echo
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$failed" -eq 1 ]; then
+            echo "::error::License gate failed. Nothing will be published."
+            printf '%s' "$details"
+            exit 1
+          fi
+          echo "License gate passed."
+
+      - name: Package executable and license files
+        id: package
+        run: |
+          set -euo pipefail
+          stage="$GITHUB_WORKSPACE/stage"
+          cp out/cloudflared.exe "$stage/cloudflared.exe"
+          cp upstream/LICENSE "$stage/LICENSE"
+          cp self/NOTICE "$stage/NOTICE"
+          if [ -n "${UPSTREAM_NOTICE_FILE:-}" ]; then
+            cp "upstream/$UPSTREAM_NOTICE_FILE" "$stage/UPSTREAM-NOTICE"
+          fi
+
+          # Normalize timestamps and modes so the archive is reproducible.
+          epoch=$(git -C upstream log -1 --format=%ct)
+          find "$stage" -type f -exec chmod 644 {} +
+          chmod 755 "$stage/cloudflared.exe"
+          find "$stage" -exec touch -h -d "@$epoch" {} +
+
+          mkdir -p dist
+          zip_name="winarm64-build-${TAG}.zip"
+          (cd "$stage" && find . -type f | sed 's|^\./||' | LC_ALL=C sort | zip -X -9 -@ "$GITHUB_WORKSPACE/dist/$zip_name")
+          (cd dist && sha256sum "$zip_name" > "$zip_name.sha256")
+
+          {
+            echo "exe_sha256=$(sha256sum "$stage/cloudflared.exe" | cut -d' ' -f1)"
+            echo "zip_sha256=$(sha256sum "dist/$zip_name" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Archive contents (\`$zip_name\`)"
+            echo
+            echo "Files under THIRD_PARTY_LICENSES/: $(unzip -Z1 "dist/$zip_name" | grep -c '^THIRD_PARTY_LICENSES/')"
+            echo
+            echo '<details><summary>Full file list</summary>'
+            echo
+            echo '```'
+            unzip -Z1 "dist/$zip_name" | LC_ALL=C sort
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: winarm64-build-${{ needs.check-upstream.outputs.tag }}
+          path: |
+            dist/winarm64-build-${{ needs.check-upstream.outputs.tag }}.zip
+            dist/winarm64-build-${{ needs.check-upstream.outputs.tag }}.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke-test:
+    name: smoke-test
+    needs: [check-upstream, build]
+    runs-on: windows-11-arm
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.check-upstream.outputs.tag }}
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: winarm64-build-${{ needs.check-upstream.outputs.tag }}
+          path: artifact
+
+      - name: Verify archive checksum
+        shell: pwsh
+        run: |
+          $zip = "artifact/winarm64-build-$($env:TAG).zip"
+          $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          "expected: $expected"
+          "actual:   $actual"
+          if ($expected -ne $actual) { throw 'SHA256 of the archive does not match the .sha256 file.' }
+
+      - name: Extract and check archive contents
+        shell: pwsh
+        run: |
+          Expand-Archive -Path "artifact/winarm64-build-$($env:TAG).zip" -DestinationPath pkg -Force
+          $required = @(
+            'cloudflared.exe',
+            'LICENSE',
+            'NOTICE',
+            'third-party-licenses.csv',
+            'THIRD_PARTY_LICENSES/go/LICENSE'
+          )
+          $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path 'pkg' $_) -PathType Leaf) })
+          if ($missing.Count -gt 0) { throw "Archive is missing: $($missing -join ', ')" }
+          Get-ChildItem pkg -Recurse -File | ForEach-Object { $_.FullName.Substring((Resolve-Path pkg).Path.Length + 1) } | Sort-Object
+
+      - name: Check PE machine type is ARM64 (0xAA64)
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path 'pkg/cloudflared.exe').Path)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $signature = [System.Text.Encoding]::ASCII.GetString($bytes, $peOffset, 2)
+          if ($signature -ne 'PE') { throw 'Not a PE file.' }
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          'PE machine type: 0x{0:X4}' -f $machine
+          if ($machine -ne 0xAA64) { throw ('Unexpected PE machine type 0x{0:X4}, expected 0xAA64 (ARM64).' -f $machine) }
+
+      - name: Run --version
+        shell: pwsh
+        working-directory: pkg
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = (& .\cloudflared.exe --version 2>&1 | Out-String).Trim()
+          $code = $LASTEXITCODE
+          $out
+          if ($code -ne 0) { throw "--version exited with code $code" }
+          if (-not $out.Contains($env:TAG)) { throw "--version output does not contain $($env:TAG)" }
+          $fence = '```'
+          ('### cloudflared.exe --version', $fence, $out, $fence) -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Run access --help
+        shell: pwsh
+        working-directory: pkg
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & .\cloudflared.exe access --help 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "access --help exited with code $LASTEXITCODE" }
+
+      - name: Check that the auto-update is disabled
+        shell: pwsh
+        working-directory: pkg
+        env:
+          EXPECTED_NAME: github.com/${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = (& .\cloudflared.exe update 2>&1 | Out-String).Trim()
+          $code = $LASTEXITCODE
+          $out
+          if ($code -ne 0) { throw "update exited with code $code" }
+          if (-not $out.Contains($env:EXPECTED_NAME)) { throw "update output does not mention $($env:EXPECTED_NAME); the auto-update may be enabled." }
+
+  release:
+    name: release
+    needs: [check-upstream, build, smoke-test]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.check-upstream.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Skip if the release already exists
+        id: exists
+        run: |
+          set -euo pipefail
+          if out=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName 2>&1); then
+            echo "::notice::Release $TAG already exists; leaving it untouched."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif grep -qi 'release not found' <<<"$out"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Could not check for an existing release: $out"
+            exit 1
+          fi
+
+      - name: Download artifact
+        if: steps.exists.outputs.exists == 'false'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: winarm64-build-${{ needs.check-upstream.outputs.tag }}
+          path: dist
+
+      - name: Verify artifact and unpack executable
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          BUILD_EXE_SHA256: ${{ needs.build.outputs.exe_sha256 }}
+          BUILD_ZIP_SHA256: ${{ needs.build.outputs.zip_sha256 }}
+        run: |
+          set -euo pipefail
+          cd dist
+          test -s "winarm64-build-${TAG}.zip"
+          test -s "winarm64-build-${TAG}.zip.sha256"
+          sha256sum -c "winarm64-build-${TAG}.zip.sha256"
+          [ "$(sha256sum "winarm64-build-${TAG}.zip" | cut -d' ' -f1)" = "$BUILD_ZIP_SHA256" ]
+          unzip -q "winarm64-build-${TAG}.zip" -d extracted
+          [ "$(sha256sum extracted/cloudflared.exe | cut -d' ' -f1)" = "$BUILD_EXE_SHA256" ]
+
+      - name: Attest build provenance
+        if: steps.exists.outputs.exists == 'false'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/winarm64-build-${{ needs.check-upstream.outputs.tag }}.zip
+            dist/extracted/cloudflared.exe
+
+      - name: Verify the attestation (the command shown in the release notes)
+        if: steps.exists.outputs.exists == 'false'
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            if gh attestation verify "winarm64-build-${TAG}.zip" --repo "$GITHUB_REPOSITORY"; then
+              exit 0
+            fi
+            echo "Attestation not verifiable yet (attempt $attempt); retrying."
+            sleep 10
+          done
+          echo "::error::Attestation could not be verified; not publishing."
+          exit 1
+
+      - name: Create release
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          UPSTREAM_COMMIT: ${{ needs.build.outputs.upstream_commit }}
+          GO_VERSION: ${{ needs.build.outputs.go_version }}
+        run: |
+          set -euo pipefail
+          zip="dist/winarm64-build-${TAG}.zip"
+          sha="$zip.sha256"
+          test -s "$zip" && test -s "$sha"
+
+          zip_sha256=$(sha256sum "$zip" | cut -d' ' -f1)
+          exe_sha256=$(sha256sum dist/extracted/cloudflared.exe | cut -d' ' -f1)
+
+          csv=dist/extracted/third-party-licenses.csv
+          total=$(wc -l < "$csv" | tr -d ' ')
+          license_rows=$(awk -F, '{print $NF}' "$csv" | sort | uniq -c | sort -rn | awk '{printf "| %s | %d |\n", $2, $1}')
+
+          cat > notes.md <<EOF
+          Unofficial Windows ARM64 build of the cloudflared client, for use with Cloudflare Tunnel™. 非官方建置，與 Cloudflare, Inc. 無關，亦未經其認可或背書。
+
+          ## Upstream
+
+          - Upstream version: \`${TAG}\` ([upstream release](https://github.com/cloudflare/cloudflared/releases/tag/${TAG}))
+          - Upstream commit: \`${UPSTREAM_COMMIT}\`
+          - Go version: \`${GO_VERSION}\`
+          - Source code: compiled as-is from the upstream tag, not modified.
+
+          ## Build parameters
+
+          - \`GOOS=windows GOARCH=arm64 CGO_ENABLED=0\` (Windows ICMP proxy is not compiled in)
+          - \`-mod=readonly -trimpath -ldflags "-s -w"\`, with \`main.Version\` and \`main.BuildTime\` set as in the upstream Makefile
+          - Built-in auto-update disabled (\`updater.BuiltForPackageManager=github.com/${GITHUB_REPOSITORY}\`)
+          - Not code-signed
+
+          ## Checksums (SHA256)
+
+          \`\`\`
+          ${zip_sha256}  winarm64-build-${TAG}.zip
+          ${exe_sha256}  cloudflared.exe
+          \`\`\`
+
+          ## Verify
+
+          \`\`\`
+          gh attestation verify winarm64-build-${TAG}.zip --repo ${GITHUB_REPOSITORY}
+          \`\`\`
+
+          ## Licenses
+
+          The archive contains the executable together with the upstream Apache-2.0 \`LICENSE\`, this project's \`NOTICE\`, the license of the Go standard library, and the full license texts of the ${total} third-party packages linked into the executable (\`THIRD_PARTY_LICENSES/\`, list in \`third-party-licenses.csv\`):
+
+          | License | Packages |
+          |---|---|
+          ${license_rows}
+
+          ---
+
+          Cloudflare, Cloudflare Tunnel, Cloudflare One and WARP are trademarks and/or registered trademarks of Cloudflare, Inc. in the United States and other jurisdictions. The cloudflared source code is distributed under the Apache License 2.0.
+          EOF
+
+          gh release create "$TAG" "$zip" "$sha" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target main \
+            --title "${TAG}（非官方 Windows ARM64 建置）" \
+            --notes-file notes.md
+
+  report-failure:
+    name: report-failure
+    needs: [check-upstream, build, smoke-test, release]
+    if: failure() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RAW_TAG: ${{ needs.check-upstream.outputs.tag || inputs.tag }}
+          UPSTREAM_COMMIT: ${{ needs.build.outputs.upstream_commit }}
+          GATE_FAILED: ${{ needs.build.outputs.license_gate_failed }}
+          GATE_DETAILS: ${{ needs.build.outputs.license_gate_details }}
+          RESULT_CHECK_UPSTREAM: ${{ needs.check-upstream.result }}
+          RESULT_BUILD: ${{ needs.build.result }}
+          RESULT_SMOKE_TEST: ${{ needs.smoke-test.result }}
+          RESULT_RELEASE: ${{ needs.release.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          tag="unknown"
+          if [[ "${RAW_TAG:-}" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]]; then tag="$RAW_TAG"; fi
+
+          failed_jobs=()
+          [ "$RESULT_CHECK_UPSTREAM" = "failure" ] && failed_jobs+=("check-upstream")
+          [ "$RESULT_BUILD" = "failure" ] && failed_jobs+=("build")
+          [ "$RESULT_SMOKE_TEST" = "failure" ] && failed_jobs+=("smoke-test")
+          [ "$RESULT_RELEASE" = "failure" ] && failed_jobs+=("release")
+          failed_list="${failed_jobs[*]:-unknown}"
+
+          if [ "${GATE_FAILED:-}" = "true" ]; then
+            title="License review needed: $tag"
+            label="license-review"
+            label_desc="License gate failed; manual review needed"
+            label_color="d93f0b"
+          else
+            title="Build failed: $tag"
+            label="build-failure"
+            label_desc="Scheduled or manual build failed"
+            label_color="b60205"
+          fi
+
+          {
+            if [ "$label" = "license-review" ]; then
+              echo "The license gate failed, so **nothing was published**. Please review the items below and decide how to proceed."
+              echo
+              echo "Baselines under \`compliance/\` and the NOTICE file are only updated through a pull request after you approve in this issue. \`--disallowed_types\` must not be relaxed to get past this check."
+            else
+              echo "A build run failed. No release was published for this run."
+            fi
+            echo
+            echo "- Failed job(s): ${failed_list}"
+            echo "- Workflow run: ${RUN_URL}"
+            echo "- Upstream tag: ${tag}"
+            echo "- Upstream commit: ${UPSTREAM_COMMIT:-not available (the failure happened before the source was checked out)}"
+            echo "- Trigger: ${EVENT_NAME} on \`${REF}\`"
+            if [ "$label" = "license-review" ]; then
+              echo
+              echo "### Details"
+              echo
+              echo '~~~~text'
+              printf '%s\n' "${GATE_DETAILS:-}"
+              echo '~~~~'
+            fi
+          } > body.md
+
+          gh label create "$label" --repo "$GITHUB_REPOSITORY" --description "$label_desc" --color "$label_color" >/dev/null 2>&1 || true
+
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label "$label" --limit 100 --json number,title \
+            | jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file body.md
+            echo "Commented on existing issue #$existing"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label "$label" --body-file body.md
+          fi
